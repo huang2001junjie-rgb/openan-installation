@@ -39,6 +39,31 @@ def render(settings=None, success=True):
     return docs
 
 
+def test_portal_defaults_initcontainer_patches_js():
+    # The portal JS hardcodes http://127.0.0.1:5001 as the backend default;
+    # the BACKEND_URL env var only configures nginx, not the JS bundle. An
+    # initContainer copies the HTML to an emptyDir and strips the absolute
+    # URL so all API calls become relative (same-origin) and route through
+    # the portal nginx proxy, which already proxies /rest/v1/orchestrate/
+    # and /api/* to the backends (field-verified bug).
+    docs = render()
+    deployment = docs["Deployment/openan-frontend"]
+    spec = deployment["spec"]["template"]["spec"]
+    init = next(c for c in spec["initContainers"] if c["name"] == "patch-portal-defaults")
+    command = " ".join(init["command"])
+    assert "127.0.0.1:5001" in command or "127\\.0\\.0\\.1:5001" in command
+    assert "127.0.0.1:5000" in command or "127\\.0\\.0\\.1:5000" in command
+    # The sed strips the absolute URL (empty replacement), not a cluster DNS
+    # name the browser cannot resolve
+    assert "orchestration-center:5001" not in command
+    # The main container serves the patched files from the emptyDir
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["portal-html"]["emptyDir"] == {}
+    container = spec["containers"][0]
+    mounts = {m["mountPath"]: m["name"] for m in container["volumeMounts"]}
+    assert mounts["/usr/share/nginx/html"] == "portal-html"
+
+
 def test_frontend_defaults_to_portal():
     docs = render()
     deployment = docs["Deployment/openan-frontend"]
@@ -48,8 +73,10 @@ def test_frontend_defaults_to_portal():
     env = {e["name"]: e["value"] for e in container["env"]}
     assert env["BACKEND_URL"] == "http://orchestration-center:5001"
     assert env["REGISTRY_URL"] == "http://registry-center:5000"
-    # portal renders no initContainer and no chart-managed nginx ConfigMap
-    assert "initContainers" not in deployment["spec"]["template"]["spec"]
+    # portal has only the JS-defaults patch initContainer (no nginx render);
+    # no chart-managed nginx ConfigMap for the portal type
+    init_names = [c["name"] for c in deployment["spec"]["template"]["spec"].get("initContainers", [])]
+    assert init_names == ["patch-portal-defaults"]
     assert "ConfigMap/openan-frontend-nginx-config" not in docs
     assert "Deployment/workflow-designer" not in docs
     assert "Service/workflow-designer" not in docs
@@ -234,6 +261,115 @@ def test_secret_volume_permissions_are_not_world_readable():
     # No whole-directory secret mounts remain on RC
     assert not any(m["mountPath"] == "/opt/registry-center/etc/ssl" and "subPath" not in m
                    for m in mounts)
+    # OC TLS also mounts per-key (subPath) into the seeded emptyDir directory
+    oc = docs["Deployment/orchestration-center"]["spec"]["template"]["spec"]["containers"][0]
+    oc_mounts = oc["volumeMounts"]
+    oc_tls_paths = {m["mountPath"] for m in oc_mounts if m.get("subPath") and "/etc/ssl/" in m["mountPath"]}
+    assert oc_tls_paths == {f"/opt/orchestration-center/etc/ssl/{k}"
+                            for k in ("server.cer", "server_key.pem", "cert_pwd", "trust.cer")}
+    # No whole-directory TLS mount on OC either
+    assert not any(m["mountPath"] == "/opt/orchestration-center/etc/ssl" and "subPath" not in m
+                   for m in oc_mounts)
+
+
+def test_storage_class_names_prevent_pv_cross_binding():
+    # Both PVs and PVCs without a storageClassName can cross-bind (field
+    # crash: the OC runtime PVC claimed the MySQL PV). Each PV/PVC pair
+    # must use a DISTINCT class name so binding is deterministic.
+    text = (ROOT / "containerized/offline-install/scripts/install.sh").read_text(encoding="utf-8")
+    # Database uses openan-local (with createStorageClass for binding mode)
+    assert 'storageClassName: openan-local' in text
+    assert 'createStorageClass: true' in text
+    # OC runtime uses a distinct class name (no cross-binding with database)
+    assert 'storageClassName: openan-oc-runtime' in text
+    # Both appear in the hostpath/auto fallback branches
+    assert text.count('storageClassName: openan-local') >= 1
+    assert text.count('storageClassName: openan-oc-runtime') >= 1
+
+
+def test_prepare_runtime_initcontainer_runs_as_root():
+    # The hostPath PVC volume root is root:10001 mode 0755 (group no write);
+    # the app user (10001) cannot mkdir. The initContainer must run as root,
+    # create data/log, chown them to 10001 and make the root group-writable.
+    docs = render()
+    init = next(c for c in
+                docs["Deployment/orchestration-center"]["spec"]["template"]["spec"]["initContainers"]
+                if c["name"] == "prepare-runtime")
+    assert init["securityContext"]["runAsUser"] == 0
+    command = " ".join(init["command"])
+    assert "chown 10001:10001" in command
+    assert "chmod 0770" in command
+
+
+def test_frontend_backend_tls_mounts_for_mtls():
+    # The frontend nginx needs TLS material to verify the backend server cert
+    # and present a client certificate (mTLS) — the BFF proxy approach the
+    # orchestration-center project itself uses (15-openan-backend.envsh).
+    # Without it, HTTPS backends requiring client certs return 502.
+    docs = render({"https.enabled": True,
+                   "frontend.backendTlsSecret": "openan-ingress-client"})
+    spec = docs["Deployment/openan-frontend"]["spec"]["template"]["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["backend-tls"]["secret"]["secretName"] == "openan-ingress-client"
+    assert volumes["backend-tls"]["secret"]["defaultMode"] == 0o440
+    mounts = spec["containers"][0]["volumeMounts"]
+    assert any(m["mountPath"] == "/etc/nginx/backend-tls" and m["readOnly"]
+               for m in mounts)
+    # No TLS volume when the secret is not set
+    default = render()
+    default_volumes = {v["name"] for v in
+                       default["Deployment/openan-frontend"]["spec"]["template"]["spec"]["volumes"]}
+    assert "backend-tls" not in default_volumes
+
+
+def test_installer_emits_frontend_backend_tls():
+    # The installer wires the ingress client Secret as the frontend backend
+    # TLS material so the frontend nginx can do mTLS to the backends.
+    text = (ROOT / "containerized/offline-install/scripts/install.sh").read_text(encoding="utf-8")
+    assert "backendTlsSecret" in text
+    assert "INGRESS_CLIENT_SECRET" in text
+
+
+def test_oc_verify_client_follows_values():
+    # The OC image defaults to ORCH_VERIFY_CLIENT=true; without the configmap
+    # override, the OC always requires client certificates regardless of the
+    # chart value, and the portal nginx (which has no client cert) gets 502.
+    docs = render()
+    config = docs["ConfigMap/orchestration-center-config"]["data"]
+    assert config["ORCH_VERIFY_CLIENT"] == "false"  # follows https.verifyClient default
+    mtls = render({"https.enabled": True, "https.verifyClient": True,
+                   "registry.ingressClientSecret": "ingress-client"})
+    assert mtls["ConfigMap/orchestration-center-config"]["data"]["ORCH_VERIFY_CLIENT"] == "true"
+
+
+def test_oc_runtime_pv_fallback_renders():
+    # PR #31 added the runtime PVC; clusters without a StorageClass left it
+    # Pending forever (field crash). The fallback mirrors the database
+    # storage blocks: createPV + useHostPath + nodeName + storageClassName.
+    docs = render({"orchestration.persistence.createPV": True,
+                   "orchestration.persistence.useHostPath": True,
+                   "orchestration.persistence.nodeName": "node185",
+                   "orchestration.persistence.storageClassName": "openan-local"})
+    pv = docs["PersistentVolume/openan-oc-runtime-pv"]
+    assert pv["spec"]["hostPath"]["path"] == "/data/openan-orchestration-runtime"
+    assert pv["spec"]["storageClassName"] == "openan-local"
+    affinity = pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"][0]["matchExpressions"][0]
+    assert affinity["values"] == ["node185"]
+    pvc = docs["PersistentVolumeClaim/orchestration-center-runtime"]
+    assert pvc["spec"]["storageClassName"] == "openan-local"
+    # Default render: no PV created
+    default = render()
+    assert "PersistentVolume/openan-oc-runtime-pv" not in default
+
+
+def test_installer_emits_orchestration_persistence():
+    # The installer must set the runtime PVC storage from STORAGE_MODE,
+    # matching the database fallback (field crash: PVC Pending, no SC).
+    text = (ROOT / "containerized/offline-install/scripts/install.sh").read_text(encoding="utf-8")
+    assert "createPV: true" in text
+    assert "/data/openan-orchestration-runtime" in text
+    # Appear in both the database section and the orchestration section
+    assert text.count("createPV: true") >= 2
 
 
 def test_installer_security_contract():

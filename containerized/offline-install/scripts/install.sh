@@ -641,6 +641,10 @@ emit_db_storage() {
         echo "    storageClassName: \"${STORAGE_CLASS}\""
     fi
     if [ "$STORAGE_MODE" = "hostpath" ] || [ "$STORAGE_MODE" = "auto" ]; then
+        # Distinct storageClassName per PV/PVC pair prevents cross-binding
+        # (e.g. the OC runtime PVC claiming the MySQL PV).
+        echo "    createStorageClass: true"
+        echo "    storageClassName: openan-local"
         echo "    createPV: true"
         echo "    useHostPath: true"
         echo "    hostPath: \"${hostpath}\""
@@ -734,6 +738,25 @@ emit_db_storage() {
             echo "      existingSecretKey: orch-chat"
         fi
     fi
+    # Runtime PVC storage: same fallback pattern as the database
+    OC_PERSISTENCE_OPEN=false
+    if [ "$STORAGE_MODE" = "sc" ] || { [ "$STORAGE_MODE" = "auto" ] && [ -n "$STORAGE_CLASS" ]; }; then
+        echo "  persistence:"
+        echo "    storageClassName: \"${STORAGE_CLASS}\""
+        OC_PERSISTENCE_OPEN=true
+    fi
+    if [ "$STORAGE_MODE" = "hostpath" ] || [ "$STORAGE_MODE" = "auto" ]; then
+        if [ "$OC_PERSISTENCE_OPEN" = "false" ]; then
+            echo "  persistence:"
+            OC_PERSISTENCE_OPEN=true
+        fi
+        # Distinct class from the database: prevents cross-binding
+        echo "    storageClassName: openan-oc-runtime"
+        echo "    createPV: true"
+        echo "    useHostPath: true"
+        echo "    hostPath: \"/data/openan-orchestration-runtime\""
+        echo "    nodeName: ${STORAGE_NODE}"
+    fi
     echo "frontend:"
     echo "  enabled: true"
     echo "  type: ${FRONTEND_TYPE}"
@@ -747,6 +770,11 @@ emit_db_storage() {
         echo "    tag: $(REF_TAG "$WORKFLOW_DESIGNER_IMAGE")"
     fi
     echo "    pullPolicy: IfNotPresent"
+    # Frontend nginx backend TLS: same material as the ingress client
+    # (verify backend certs, present client cert for mTLS backends).
+    if [ "$HTTPS_ENABLED" = "true" ] && [ -n "$INGRESS_CLIENT_SECRET" ]; then
+        echo "  backendTlsSecret: \"${INGRESS_CLIENT_SECRET}\""
+    fi
     echo "ingress:"
     echo "  enabled: true"
     echo "  className: nginx"
